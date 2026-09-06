@@ -9,8 +9,12 @@ import os
 st.set_page_config(page_title="ガソリン記録アプリ", layout="wide")
 
 DATA_FILE = "gasoline_data.csv"
-# APIキーをStreamlitのSecret機能から安全に取得する
-API_KEY = st.secrets["GEMINI_API_KEY"]
+
+# APIキーをStreamlit Secretsから安全に取得
+try:
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    API_KEY = ""
 
 COLUMN_ORDER = [
     "車両", "日付", "スタンド名", "総走行距離(ODO)", "ODO差分(km)", "区間距離(TRIP)",
@@ -44,78 +48,116 @@ car_option = st.sidebar.selectbox("記録・表示する車両を選択", ["ア�
 
 st.subheader(f"車両: 【{car_option}】")
 
+# 過去データの読み込み（前回データ・スタンド名の取得用）
+last_odo = 0
+last_ss_name = ""
+avg_fe_historical = 0.0
+
+if os.path.exists(DATA_FILE):
+    try:
+        df_exist = pd.read_csv(DATA_FILE)
+        if "車両" in df_exist.columns:
+            df_car_exist = df_exist[df_exist["車両"] == car_option].dropna(subset=["日付"]).copy()
+            if not df_car_exist.empty:
+                df_car_exist["dt"] = pd.to_datetime(df_car_exist["日付"], errors='coerce')
+                df_car_sorted = df_car_exist.sort_values("dt")
+                
+                # 前回のODOとスタンド名を取得
+                if "総走行距離(ODO)" in df_car_sorted.columns:
+                    last_odo = df_car_sorted["総走行距離(ODO)"].iloc[-1]
+                if "スタンド名" in df_car_sorted.columns and pd.notna(df_car_sorted["スタンド名"].iloc[-1]):
+                    last_ss_name = str(df_car_sorted["スタンド名"].iloc[-1])
+                    
+                # 過去平均燃費の取得
+                if "燃費(km/L)" in df_car_sorted.columns and "統計対象" in df_car_sorted.columns:
+                    valid_fe = df_car_sorted[(df_car_sorted["統計対象"] == True) & (df_car_sorted["燃費(km/L)"] > 0)]
+                    if not valid_fe.empty:
+                        avg_fe_historical = valid_fe["燃費(km/L)"].mean()
+    except Exception:
+        pass
+
 # --- 1. レシート画像アップロード ＆ 手入力 ---
 st.markdown("### 1. レシートと走行距離を入力")
 
 col_img, col_input = st.columns([1, 1])
 
 with col_img:
-    uploaded_file = st.file_uploader("レシート画像をアップロード", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="アップロードしたレシート", width=300)
-        
-        if st.button("レシートから自動読み取り"):
-            with st.spinner("AI解析中（店舗名・手書きメモ含む）..."):
-                try:
-                    client = genai.Client(api_key=API_KEY)
-                    prompt = (
-                        "このレシートから以下の項目を抽出してください。\n"
-                        "1. 日付 (YYYY-MM-DD)\n"
-                        "2. ガソリンスタンド名（店舗名・会社名。例: ENEOS〇〇SS, 出光 〇〇店など）\n"
-                        "3. 給油量 (L)\n"
-                        "4. 単価 (円/L)\n"
-                        "5. 支払合計金額 (円)\n"
-                        "6. レシート上部や余白に手書きされている『TRIP』または『トリップ』または『区間距離』の数値(km)\n"
-                        "7. レシート上部や余白に手書きされている『ODO』または『オド』または『総走行距離』の数値(km)\n\n"
-                        "該当がない項目や不明な場合は None としてください。\n"
-                        "出力はカンマ区切りで『2026-09-01,ENEOS 百草SS,35.0,162.0,5670,450.2,123456』のように1行で返してください。"
-                    )
-                    
-                    response = client.models.generate_content(
-                        model='gemini-3.6-flash',
-                        contents=[image, prompt]
-                    )
-                    
-                    res_text = response.text.strip()
-                    parts = res_text.split(",")
-                    
-                    if len(parts) >= 5:
-                        st.session_state.parsed_date = datetime.strptime(parts[0].strip(), "%Y-%m-%d")
-                        st.session_state.parsed_ss_name = parts[1].strip() if parts[1].strip() != "None" else ""
-                        st.session_state.parsed_volume = float(parts[2].strip())
-                        st.session_state.parsed_unit_price = float(parts[3].strip())
-                        st.session_state.parsed_amount = int(float(parts[4].strip()))
-                        
-                        st.session_state.parsed_hand_trip = float(parts[5].strip()) if (len(parts) > 5 and parts[5].strip().replace('.', '', 1).isdigit()) else None
-                        st.session_state.parsed_hand_odo = int(float(parts[6].strip())) if (len(parts) > 6 and parts[6].strip().replace('.', '', 1).isdigit()) else None
+    input_method = st.radio("レシート画像の入力方法", ["ファイルから選択", "📷 スマホのカメラで撮影"], horizontal=True)
+    
+    image = None
+    if input_method == "ファイルから選択":
+        uploaded_file = st.file_uploader("レシート画像をアップロード", type=["jpg", "jpeg", "png"])
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
+    else:
+        camera_file = st.camera_input("カメラで撮影")
+        if camera_file is not None:
+            image = Image.open(camera_file)
 
-                        st.session_state.is_parsed = True
-                        st.success("解析完了！スタンド名や手書きメモも読み取りました")
-                    else:
-                        st.warning(f"取得データ形式エラー: {res_text}")
-                except Exception as e:
-                    st.error(f"解析エラー: {e}")
+    if image is not None:
+        st.image(image, caption="対象のレシート", width=300)
+        if st.button("🤖 レシートから自動読み取り"):
+            if not API_KEY:
+                st.error("APIキーが設定されていません。Streamlit Secretsを確認してください。")
+            else:
+                with st.spinner("AI解析中（店舗名・手書きメモ含む）..."):
+                    try:
+                        client = genai.Client(api_key=API_KEY)
+                        prompt = (
+                            "このレシートから以下の項目を抽出してください。\n"
+                            "1. 日付 (YYYY-MM-DD)\n"
+                            "2. ガソリンスタンド名（店舗名・会社名。例: ENEOS〇〇SS, 出光 〇〇店など）\n"
+                            "3. 給油量 (L)\n"
+                            "4. 単価 (円/L)\n"
+                            "5. 支払合計金額 (円)\n"
+                            "6. レシート上部や余白に手書きされている『TRIP』または『トリップ』または『区間距離』の数値(km)\n"
+                            "7. レシート上部や余白に手書きされている『ODO』または『オド』または『総走行距離』の数値(km)\n\n"
+                            "該当がない項目や不明な場合は None としてください。\n"
+                            "出力はカンマ区切りで『2026-09-01,ENEOS 百草SS,35.0,162.0,5670,450.2,123456』のように1行で返してください。"
+                        )
+                        
+                        response = client.models.generate_content(
+                            model='gemini-3.6-flash',
+                            contents=[image, prompt]
+                        )
+                        
+                        res_text = response.text.strip()
+                        parts = res_text.split(",")
+                        
+                        if len(parts) >= 5:
+                            st.session_state.parsed_date = datetime.strptime(parts[0].strip(), "%Y-%m-%d")
+                            st.session_state.parsed_ss_name = parts[1].strip() if parts[1].strip() != "None" else last_ss_name
+                            st.session_state.parsed_volume = float(parts[2].strip())
+                            st.session_state.parsed_unit_price = float(parts[3].strip())
+                            st.session_state.parsed_amount = int(float(parts[4].strip()))
+                            
+                            st.session_state.parsed_hand_trip = float(parts[5].strip()) if (len(parts) > 5 and parts[5].strip().replace('.', '', 1).isdigit()) else None
+                            st.session_state.parsed_hand_odo = int(float(parts[6].strip())) if (len(parts) > 6 and parts[6].strip().replace('.', '', 1).isdigit()) else None
+
+                            st.session_state.is_parsed = True
+                            st.success("解析完了！スタンド名や手書きメモも読み取りました")
+                        else:
+                            st.warning(f"取得データ形式エラー: {res_text}")
+                    except Exception as e:
+                        st.error(f"解析エラー: {e}")
 
 with col_input:
-    last_odo = 0
-    if os.path.exists(DATA_FILE):
-        try:
-            df_exist = pd.read_csv(DATA_FILE)
-            if "車両" in df_exist.columns and "総走行距離(ODO)" in df_exist.columns:
-                df_car_exist = df_exist[df_exist["車両"] == car_option].dropna(subset=["日付"])
-                if not df_car_exist.empty:
-                    df_car_exist["dt"] = pd.to_datetime(df_car_exist["日付"], errors='coerce')
-                    df_car_sorted = df_car_exist.sort_values("dt")
-                    last_odo = df_car_sorted["総走行距離(ODO)"].iloc[-1]
-        except Exception:
-            pass
-    
     if last_odo > 0:
         st.info(f"💡 前回のODO（総走行距離）: **{int(last_odo):,} km**")
 
-    current_odo = st.number_input("現在の総走行距離 (ODO km)", min_value=0, value=int(last_odo) if last_odo > 0 else 0, step=1)
     trip_distance = st.number_input("今回リセットした区間距離 (TRIP km)", min_value=0.0, step=0.1, format="%.1f", help="ガソリンを入れた時にリセットしているトリップメーターの距離を入力")
+    
+    # TRIP入力時の想定ODO表示機能
+    estimated_odo = int(last_odo + trip_distance) if (last_odo > 0 and trip_distance > 0) else int(last_odo)
+    odo_help = f"前回のODO ({int(last_odo):,}km) + TRIP ({trip_distance}km) ＝ 想定ODO ({estimated_odo:,}km)" if (last_odo > 0 and trip_distance > 0) else ""
+
+    current_odo = st.number_input(
+        "現在の総走行距離 (ODO km)", 
+        min_value=0, 
+        value=estimated_odo if (last_odo > 0 and trip_distance > 0) else (int(last_odo) if last_odo > 0 else 0), 
+        step=1,
+        help=odo_help
+    )
 
 odo_diff = current_odo - last_odo if (last_odo > 0 and current_odo > last_odo) else 0
 
@@ -143,8 +185,6 @@ if st.session_state.is_parsed:
         c_p, c_t = st.columns(2)
         c_p.metric("💴 支払合計金額", f"{st.session_state.parsed_amount:,} 円")
         c_t.metric("📝 手書きTRIP (参考)", f"{st.session_state.parsed_hand_trip:.1f} km" if st.session_state.parsed_hand_trip is not None else "読み取り無し")
-        
-        st.caption(f"📝 手書きODO (参考): {f'{st.session_state.parsed_hand_odo:,} km' if st.session_state.parsed_hand_odo is not None else '読み取り無し'}")
 
     with col_calc:
         st.markdown("#### 🧮 計算値（算出結果）")
@@ -158,16 +198,24 @@ if st.session_state.is_parsed:
         c7.metric("📏 ODO差分", f"{odo_diff:,} km" if odo_diff > 0 else "前回同値/未入力")
         c8.metric("📊 TRIPとの差", f"{round(trip_distance - odo_diff, 1):+g} km" if (odo_diff > 0 and trip_distance > 0) else "-")
 
+    # 燃費異変アラート
+    if calc_fe > 0 and avg_fe_historical > 0:
+        if calc_fe < (avg_fe_historical * 0.8):
+            st.warning(f"⚠️ **燃費注意アラート**: 今回の概算燃費（{calc_fe:.2f} km/L）は、過去の平均（{avg_fe_historical:.2f} km/L）より20%以上低めです。（※エアコン使用、チョイ乗り増加、タイヤの空気圧低下などの可能性があります）")
+
 # --- 3. 確認・保存フォーム ---
 st.markdown("---")
 with st.form("record_form"):
     st.markdown("### 2. 内容を確認して記録")
     
+    # スタンド名の初期値（解析値がない場合は前回のスタンド名）
+    default_ss = st.session_state.parsed_ss_name if st.session_state.parsed_ss_name else last_ss_name
+
     col1, col2, col3, col4, col5 = st.columns([1.2, 1.8, 1, 1, 1])
     with col1:
         input_date = st.date_input("給油日", st.session_state.parsed_date)
     with col2:
-        input_ss_name = st.text_input("⛽ スタンド名", value=st.session_state.parsed_ss_name, placeholder="例: ENEOS 日野SS")
+        input_ss_name = st.text_input("⛽ スタンド名", value=default_ss, placeholder="例: ENEOS 日野SS")
     with col3:
         input_volume = st.number_input("給油量 (L)", value=st.session_state.parsed_volume, format="%.2f")
     with col4:
@@ -177,7 +225,7 @@ with st.form("record_form"):
     
     col_m, col_c = st.columns([3, 1])
     with col_m:
-        input_memo = st.text_input("📝 備考（任意メモ）", placeholder="例: 旅行で高速利用、初回記録で計算誤差アリ、等")
+        input_memo = st.text_input("📝 備考（任意メモ）", placeholder="例: 旅行で高速利用、エアコン多用など")
     with col_c:
         input_use_stat = st.checkbox("📊 統計・分析データに含める", value=True)
     
@@ -223,7 +271,7 @@ if submit_button:
         st.session_state.is_parsed = False
         st.rerun()
 
-# --- 5. データ分析 ＆ グラフ ＆ 編集機能 ---
+# --- 5. データ分析 ＆ 月別集計 ＆ グラフ ＆ 編集機能 ---
 if os.path.exists(DATA_FILE):
     try:
         df_all = pd.read_csv(DATA_FILE)
@@ -249,15 +297,37 @@ if os.path.exists(DATA_FILE):
         st.markdown("---")
         
         if not df_car.empty:
-            # 日付型に変換してソートできるように準備
             df_car["dt"] = pd.to_datetime(df_car["日付"], errors='coerce')
             df_car = df_car.sort_values("dt").reset_index(drop=True)
             df_car["日付"] = df_car["dt"].dt.strftime("%Y-%m-%d")
-            df_car = df_car.drop(columns=["dt"])
+            
+            # --- 月別コストサマリー機能 ---
+            st.subheader(f"📅 【{car_option}】 月別・利用コスト集計")
+            
+            df_car["年月"] = df_car["dt"].dt.strftime("%Y-%m")
+            available_months = sorted(df_car["年月"].dropna().unique(), reverse=True)
+            
+            if available_months:
+                selected_month = st.selectbox("集計対象の月を選択", available_months, index=0)
+                df_month = df_car[df_car["年月"] == selected_month]
+                
+                m_trip = df_month["区間距離(TRIP)"].sum()
+                m_volume = df_month["給油量(L)"].sum()
+                m_amount = df_month["支払金額(円)"].sum()
+                m_count = len(df_month)
+                
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("💴 今月のガソリン代", f"{int(m_amount):,} 円", f"給油回数: {m_count}回")
+                mc2.metric("⛽ 総給油量", f"{m_volume:.2f} L")
+                mc3.metric("🗺️ 総走行距離", f"{m_trip:.1f} km")
+                mc4.metric("💡 月間平均単価", f"{round(m_amount/m_volume, 1) if m_volume > 0 else 0} 円/L")
+
+            st.markdown("---")
+            df_car = df_car.drop(columns=["dt", "年月"])
             
             df_stat = df_car[df_car["統計対象"] == True]
             
-            st.subheader(f"📊 【{car_option}】 の燃費・単価データ分析")
+            st.subheader(f"📊 【{car_option}】 の燃費・単価データ分析（全期間）")
             
             valid_fe = df_stat[df_stat["燃費(km/L)"] > 0]
             valid_price = df_stat[df_stat["ガソリン単価(円/L)"] > 0]
@@ -318,7 +388,6 @@ if os.path.exists(DATA_FILE):
                 st.caption("💡 「統計対象」のチェックを外すと、そのデータを平均値や推移グラフから外せます。")
             with col_tb2:
                 if st.button("🔄 日付順に並べ直してODO再計算", use_container_width=True):
-                    # 日付順ソート ＆ ODO差分再計算
                     df_car["dt"] = pd.to_datetime(df_car["日付"], errors='coerce')
                     df_car_sorted = df_car.sort_values("dt").reset_index(drop=True)
                     df_car_sorted["日付"] = df_car_sorted["dt"].dt.strftime("%Y-%m-%d")
@@ -328,10 +397,10 @@ if os.path.exists(DATA_FILE):
                         if i == 0:
                             df_car_sorted.loc[i, "ODO差分(km)"] = None
                         else:
-                            prev_odo = df_car_sorted.loc[i-1, "総走行距離(ODO)"]
-                            curr_odo = df_car_sorted.loc[i, "総走行距離(ODO)"]
-                            if pd.notna(curr_odo) and pd.notna(prev_odo) and curr_odo > prev_odo:
-                                df_car_sorted.loc[i, "ODO差分(km)"] = int(curr_odo - prev_odo)
+                            prev_odo_val = df_car_sorted.loc[i-1, "総走行距離(ODO)"]
+                            curr_odo_val = df_car_sorted.loc[i, "総走行距離(ODO)"]
+                            if pd.notna(curr_odo_val) and pd.notna(prev_odo_val) and curr_odo_val > prev_odo_val:
+                                df_car_sorted.loc[i, "ODO差分(km)"] = int(curr_odo_val - prev_odo_val)
                             else:
                                 df_car_sorted.loc[i, "ODO差分(km)"] = None
                     
@@ -340,7 +409,7 @@ if os.path.exists(DATA_FILE):
                     df_updated = df_updated[COLUMN_ORDER]
                     df_updated.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
                     
-                    st.success("日付順に綺麗に整列し、ODO差分を再計算しました！")
+                    st.success("日付順に整列し、ODO差分を再計算しました！")
                     st.rerun()
 
             edited_df = st.data_editor(
