@@ -16,6 +16,8 @@ try:
 except Exception:
     API_KEY = ""
 
+CAR_LIST = ["アウトバックBS9", "アウトバックBMR"]
+
 COLUMN_ORDER = [
     "車両", "日付", "スタンド名", "総走行距離(ODO)", "ODO差分(km)", "区間距離(TRIP)",
     "給油量(L)", "支払金額(円)", "ガソリン単価(円/L)", "燃費(km/L)",
@@ -46,7 +48,7 @@ if "bulk_df" not in st.session_state:
 
 # --- 車両選択 ---
 st.sidebar.header("🚗 車両選択")
-car_option = st.sidebar.selectbox("記録・表示する車両を選択", ["アウトバックBS9", "アウトバックBMR"])
+car_option = st.sidebar.selectbox("記録・表示する車両を選択", CAR_LIST)
 
 st.subheader(f"車両: 【{car_option}】")
 
@@ -276,7 +278,7 @@ with tab_single:
 # ==========================================
 with tab_bulk:
     st.markdown("### 📸 複数レシートの一括読み取り ＆ 一括整理")
-    st.info("過去のレシート写真をまとめてアップロードすると、AIがすべて自動解析して一覧表にします。手修正後に『日付順整理＆再計算』を押すと、ODO差分や燃費を全自動で再計算できます。")
+    st.info("過去のレシート写真をまとめてアップロードすると、AIがすべて自動解析して一覧表にします。車両の変更、修正、日付順整理＆再計算ができます。")
 
     bulk_files = st.file_uploader("大量のレシート写真をまとめて選択・アップロード", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="bulk_files")
 
@@ -322,7 +324,7 @@ with tab_bulk:
                         p_odo = int(float(parts[6].strip())) if (len(parts)>6 and parts[6].strip().replace('.','',1).isdigit()) else 0
 
                         parsed_list.append({
-                            "車両": car_option,
+                            "車両": car_option, # 初期値は現在左で選ばれている車両
                             "日付": p_date,
                             "スタンド名": p_ss,
                             "総走行距離(ODO)": p_odo,
@@ -347,10 +349,29 @@ with tab_bulk:
     if st.session_state.bulk_df is not None and not st.session_state.bulk_df.empty:
         st.markdown("---")
         st.markdown("### ✏️ 一括解析結果のプレビュー ＆ 修正")
-        st.caption("読み取りミスや不足している箇所の数値を直接編集してください。編集後『🔄 日付順に並べ替えて全自動再計算』を押してください。")
+        st.caption("「車両」列のプルダウンで車両を個別に変更できます。また下のボタンで表全体を一括変更することも可能です。")
 
+        # 一括車両変更機能
+        col_c1, col_c2 = st.columns([2, 1])
+        with col_c1:
+            bulk_car_target = st.selectbox("一括適用する車両を選択", CAR_LIST, key="bulk_car_target")
+        with col_c2:
+            st.write("") # スペース調整
+            if st.button("🚗 上の全レシートをこの車両に変更", use_container_width=True):
+                st.session_state.bulk_df["車両"] = bulk_car_target
+                st.success(f"取り込んだ全データの車両を『{bulk_car_target}』に変更しました！")
+                st.rerun()
+
+        # テーブル設定（車両列をプルダウン選択可能にする）
         edited_bulk = st.data_editor(
             st.session_state.bulk_df,
+            column_config={
+                "車両": st.column_config.SelectboxColumn(
+                    "車両",
+                    options=CAR_LIST,
+                    required=True
+                )
+            },
             num_rows="dynamic",
             use_container_width=True,
             key="bulk_editor"
@@ -362,33 +383,37 @@ with tab_bulk:
             if st.button("🔄 日付順に並べ替えて全自動再計算", use_container_width=True):
                 df_calc = edited_bulk.copy()
                 df_calc["dt"] = pd.to_datetime(df_calc["日付"], errors='coerce')
-                df_calc = df_calc.sort_values("dt").reset_index(drop=True)
+                df_calc = df_calc.sort_values(["車両", "dt"]).reset_index(drop=True)
                 df_calc["日付"] = df_calc["dt"].dt.strftime("%Y-%m-%d")
                 df_calc = df_calc.drop(columns=["dt"])
 
-                for idx in range(len(df_calc)):
-                    vol = df_calc.loc[idx, "給油量(L)"]
-                    trip = df_calc.loc[idx, "区間距離(TRIP)"]
-                    amt = df_calc.loc[idx, "支払金額(円)"]
-                    u_price = df_calc.loc[idx, "ガソリン単価(円/L)"]
+                # 車両ごとにグループ化して再計算
+                for car in CAR_LIST:
+                    car_indices = df_calc[df_calc["車両"] == car].index
+                    for i_idx, idx in enumerate(car_indices):
+                        vol = df_calc.loc[idx, "給油量(L)"]
+                        trip = df_calc.loc[idx, "区間距離(TRIP)"]
+                        amt = df_calc.loc[idx, "支払金額(円)"]
+                        u_price = df_calc.loc[idx, "ガソリン単価(円/L)"]
 
-                    # 単価補正
-                    if u_price == 0 and vol > 0 and amt > 0:
-                        df_calc.loc[idx, "ガソリン単価(円/L)"] = round(amt / vol, 1)
+                        # 単価補正
+                        if u_price == 0 and vol > 0 and amt > 0:
+                            df_calc.loc[idx, "ガソリン単価(円/L)"] = round(amt / vol, 1)
 
-                    # 燃費計算
-                    if vol > 0 and trip > 0:
-                        df_calc.loc[idx, "燃費(km/L)"] = round(trip / vol, 2)
+                        # 燃費計算
+                        if vol > 0 and trip > 0:
+                            df_calc.loc[idx, "燃費(km/L)"] = round(trip / vol, 2)
 
-                    # ODO差分計算
-                    if idx > 0:
-                        prev_odo_v = df_calc.loc[idx-1, "総走行距離(ODO)"]
-                        curr_odo_v = df_calc.loc[idx, "総走行距離(ODO)"]
-                        if pd.notna(curr_odo_v) and pd.notna(prev_odo_v) and curr_odo_v > prev_odo_v:
-                            df_calc.loc[idx, "ODO差分(km)"] = int(curr_odo_v - prev_odo_v)
+                        # 車両内でのODO差分計算
+                        if i_idx > 0:
+                            prev_idx = car_indices[i_idx - 1]
+                            prev_odo_v = df_calc.loc[prev_idx, "総走行距離(ODO)"]
+                            curr_odo_v = df_calc.loc[idx, "総走行距離(ODO)"]
+                            if pd.notna(curr_odo_v) and pd.notna(prev_odo_v) and curr_odo_v > prev_odo_v:
+                                df_calc.loc[idx, "ODO差分(km)"] = int(curr_odo_v - prev_odo_v)
 
                 st.session_state.bulk_df = df_calc
-                st.success("日付順にソートし、単価・燃費・ODO差分を自動再計算しました！")
+                st.success("車両ごとに日付順ソートし、単価・燃費・ODO差分を自動再計算しました！")
                 st.rerun()
 
         with col_b2:
@@ -554,6 +579,13 @@ if os.path.exists(DATA_FILE):
 
             edited_df = st.data_editor(
                 df_car,
+                column_config={
+                    "車両": st.column_config.SelectboxColumn(
+                        "車両",
+                        options=CAR_LIST,
+                        required=True
+                    )
+                },
                 num_rows="dynamic",
                 use_container_width=True,
                 key=f"editor_{car_option}"
